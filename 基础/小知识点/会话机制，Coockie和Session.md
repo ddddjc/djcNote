@@ -54,7 +54,7 @@ curl --location --request GET 'http://localhost:8080/question/6' \
 //获取Session
 request.getSession();　　//如果没有将创建一个新的，等效getSession(true);
 ```
-- 需要注意的是，`getSession()`方法是定义在`HttpServletRequest`接口中的抽象方法，request.getSession()的实现是由Servlet容器（tomcat，jetty）提供的，容器会根据规范实现会话管理，并在需要时创建和管理会话对象。具体看[[基础/tomcat/tomcat请求处理流程|tomcat请求处理流程]]
+- 需要注意的是，`getSession()`方法是定义在`HttpServletRequest`接口中的抽象方法，request.getSession()的实现是由Servlet容器（tomcat，jetty）提供的，容器会根据规范实现会话管理，并在需要时创建和管理会话对象。具体看[[基础/tomcat/tomcat架构|tomcat架构]]
 2.session的生命周期：只要浏览器不发送指令去删除session，session会一直存在。关闭浏览器后可能会删除内存中的cookie，导致获取不到SessionId，后来访问后重新登录，这样看起来会**像**是关闭浏览器就删除了session。正是因为浏览器不会让服务器删除session，迫使session设置了一个失效时间。当超过失效时间，会默认用户退出登录，后删除session（先持久化）。
 - 创建：执行request.getSession();
 - 销毁：
