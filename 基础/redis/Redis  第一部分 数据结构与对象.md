@@ -144,7 +144,7 @@ typedef struct list {
 			//当rehash不在进行时，值为-1
 			long trehashidx; /* rehashing not in progress if rehashidx == -1 */
 		}
-
+		
 		typedef struct dictType {  
 	    uint64_t (*hashFunction)(const void *key);  
 	    void *(*keyDup)(dict *d, const void *key);  
@@ -158,9 +158,9 @@ typedef struct list {
 	    size_t (*dictEntryMetadataBytes)(dict *d);  
 	    size_t (*dictMetadataBytes)(void);  
 	    void (*afterReplaceEntry)(dict *d, dictEntry *entry);  
-	} dictType;
+		} dictType;
 		```
-![字典数据结构.drawio.png](https://cdn.jsdelivr.net/gh/mydy930657303/djcPicture/202305261429753.png)
+		![字典数据结构.drawio.png](https://cdn.jsdelivr.net/gh/mydy930657303/djcPicture/202305261429753.png)
 - 哈希算法及特点
 	- 将新的键值对要插入到字典里时，根据键值对的键计算出哈希值和索引值，然后根据索引值放到哈希数表数组的指定索引上。
 		- hash=hash->type->hsahFunction(key);//计算哈希值
