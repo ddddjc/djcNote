@@ -147,7 +147,7 @@ ack指Acknowledge，确认。表示消费端收到消息后的确认方式。
 
   1. 消息长度达到限制
 
-  1. 消费者拒绝消费信息，basicNack/basicReject，并不把消息重新放入目标队列，requeue=false
+  1. 消费者拒绝消费信息，basicNack/basicReject，并不把消息重新放入目标队列，requeue=false 
 
   1. 原队列存在消息过期设置，消息达超时时间未被消费
 
