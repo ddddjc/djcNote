@@ -196,7 +196,7 @@ typedef struct dictType {
 		- 内存开销大：哈希表的索引空间过多会占用更多的内存空间，导致内存的浪费。
 		- 内存碎片化：过多的索引空间可能会导致内存碎片化问题，使得内存的连续可用空间变少。
 		- 
-	- rehash步骤：
+	- **rehash步骤：**
 		1. 为字典的ht[1]哈希表分配空间，空间大小取决于要执行的操作以及[0]当前包含的键值对数量(即ht[0].used属性的值)
 			-  若为拓展操作，这ht[1]大小为第一个大于等于ht[0].used* 2   的2^n的数
 			-  若为收缩，这ht[0]大小为第一个大于等于ht[0].used   的2^n的数
@@ -210,7 +210,7 @@ typedef struct dictType {
 		- 原因：在执行BGSAVE或者BGREWRITEAOP命令时，Redis需要创建当前服务器进程的子进程，而大多数操作系统都采用**写时复制**技术来优化子进程的使用效率，所以提供所需的负载因子来避免进行哈希拓展操作，这样可以避免不必要的内存写入，最大限度地节约内存。
 	- 当负载因子小于0.1时进行收缩操作。
 	- 关于写时复制：Redis在执行BGSAVE或BGREWRITEAOF命令时，会fork出一个子进程来生成rdb文件或重写AOF文件，采用写时复制技术，父子进程共享同一片内存区域，当任一进程企图对这片内存区域进行写入操作时，会把将要写入的那一部分内存页复制一份进行写入，其他内存页依旧共享。在字典扩容期间，父进程要迁移数据，不可避免的会有大量内存写入操作，为了减少内存页过多的复制，而提高了扩容的门限，这是出于节省内存考虑的。至于为什么Redis字典收缩时不用考虑写时复制？我认为原因有两个：一是收缩条件是键值对个数小于哈希表长度的10%，有意设置的这么低，就是为了不会造成过多的页分离；二是收缩操作完成会释放一部分内存，本身目的就是节省内存的。所以两个原因综合起来，不用考虑写时复制对收缩的影响。参考[[基础/小知识点/写时复制|写时复制]]
-- 渐进式rehash
+- **渐进式rehash**
 	- rehash的动作不是一次完成的，而是分多次、渐进式的完成的。
 		- 如果键值对过多，如果要一次性完成可能会造成庞大的计算量导致服务器在一段时间内停止服务。
 	- 步骤：
@@ -394,3 +394,377 @@ encoding记录了节点的content属性所保存的数据类型以及长度
 - 首先，压缩列表里要恰好有多个连续的、长度介于250字节至253字节之间的节点，连锁更新才有可能被引发，在实例中，这种情况并不多见
 - 其次，即使出现连锁更新，但主要被更新的节点数量不多，就不会对性能造成任何影响：比如三五个节点进行连锁更新是绝对不对印象性能的。
 
+## 七：对象
+
+前面记录了Redis用到的所有主要数据结构，但它并没有直接使用这些数据结构来实现键值对数据库，而是基于这些数据结构创建一个对象系统，这个系统包含字符串对象、列表对象、哈希对象、集合对象和有序集合对象这五种类型的对象，每种对象都用到了至少一种上面的数据结构
+
+通过这五种不同类型的对象，Redis可以在执行命令之前，根据对象类型判断一个对象是否可以执行给定的命令，还可以针对不同的使用场景，为对象设置多种不同的数据结构实现，从而优化对象在不同场景下的使用效率。
+
+除此之外，Redis的对象系统还实现了基于引用计数技术的内存回收机制，当程序不再使用某个对象时，这个对象锁占用的内存就会被自动释放；另外，Redis还通过引用计数技术实现了对象共享机制，这一机制可以在适当的条件下，通过让多个数据库共享同一个对象来节约内存。
+
+最后，Redis的对象带有访问时间记录信息，该信息可用于计算数据库键的空转时长，在服务器启用了maxmemory功能的情况下，空转时长较大的那些键可能会优先被服务器销毁。
+
+### 对象类型与编码：
+
+Redis使用对象来表示数据库中的键和值，每次当我们在Redis中新创建一个键值对时，我们至少会创建**两个**对象，**一个作为键对象，一个作为值对象。**
+
+Redis中每个对象都是由一个RedisObject结构表示，该结构中和保存数据有关的三个属性分别是type属性，encoding属性和ptr属性
+
+```c++
+typedef struct redisObject {
+    //类型
+    unsigned type:4;
+    //编码
+    unsigned encoding:4;
+    //指向底层实现数据结构的指针
+    void *ptr;
+    //...
+}robj;
+```
+
+![image-20230815153727698](https://cdn.jsdelivr.net/gh/mydy930657303/djcPicture@master/202308151537746.png)
+
+#### 类型：
+
+对象的type属性记录了对象的类型，这个属性的值可以是下面表格中的常量中一个
+
+| 类型常量     | 对象名称     | TYPE命令的输出 |
+| ------------ | ------------ | -------------- |
+| REDIS_STRING | 字符串对象   | "string"       |
+| REDIS_LIST   | 列表对象     | "list"         |
+| REDIS_HASH   | 哈希对象     | "hash"         |
+| REDIS_SET    | 集合对象     | "set"          |
+| REDIS_ZSET   | 有序集合对象 | "zset"         |
+
+对于Redis数据库保存的键值对来说，键总是一个字符串对象，而值则可以是字符串对象、列表对象、哈希独享、集合对象、有序集合对象中的一种，因此：
+
+- 我们称呼一个数据库键位“字符串键”时，我们指的是`这个数据库键所对应的值为字符串对象`
+- 同理，我们称一个键为XX时，指的是`这个键所对应的值为XX对象`
+
+#### 编码和底层实现：
+
+对象的ptr指针指向对象的底层数据结构，而这些数据结构由对象的encoding属性决定。
+
+encoding属性记录了对象所使用的编码，也即是说这个对象使用了什么数据结构作为底层实现，这个属性的值可以是下面列表中的常量：
+
+| 编码常量                  | 编码所对应的底层数据结构   |
+| ------------------------- | -------------------------- |
+| REDIS_ENCODING_INT        | long类型的整数             |
+| REDIS_ENCODING_EMBSTR     | embstr编码的简单动态字符串 |
+| REDIS_ENCODING_RAW        | 简单动态字符串             |
+| REDIS_ENCODING_HT         | 字典                       |
+| REDIS_ENCODING_LINKEDLIST | 双端链表                   |
+| REDIS_ENCODING_ZIPLIST    | 压缩列表                   |
+| REDIS_ENCODING_INTSET     | 整数集合                   |
+| REDIS_ENCODING_SKIPLIST   | 跳跃表和字典               |
+
+每种类型的对象都至少使用了两种不同的编码，如下
+
+> 使用OBJECT ENCODING 可以查看一个数据库键的值对象的编码
+
+![image-20230815161756208](https://cdn.jsdelivr.net/gh/mydy930657303/djcPicture@master/202308151617308.png)
+
+
+| 类型         | 编码                      | 对象                                           |
+| ------------ | ------------------------- | ---------------------------------------------- |
+| RESID_STRING | REDIS_ENCODING_INT        | 使用整数值实现的字符串对象                     |
+| REDIS_STRING | REDIS_ENCODING_EMBSTR     | 使用embstr编码的简单动态字符串实现的字符串对象 |
+| REDIS_STRING | REDIS_ENCODING_RAW        | 使用简单动态字符串实现的字符串对象             |
+| REDIS_LIST   | REDIS_ENCODING_ZIPLIST    | 使用压缩列表实现的列表对象                     |
+| REDIS_LIST   | REDIS_ENCODING_LINKEDLIST | 使用双端链表实现的列表对象                     |
+| REDIS_HASH   | REDIS_ENCODING_ZIPLIST    | 使用压缩列表实现的哈希对象                     |
+| REDIS_HASH   | REDIS_ENCODING_HT         | 使用字典实现的哈希对象                         |
+| REDIS_SET    | REDIS_ENCODING_INTSET     | 使用整数集合实现的集合对象                     |
+| REDIS_SET    | REDIS_ENCODING_HT         | 使用字典实现的集合对象                         |
+| REDIS_ZSET   | REDIS_ENCODING_ZIPLIST    | 使用压缩列表实现的有序集合对象                 |
+| REDIS_ZSET   | REDIS_ENCODING__SKIPLIST  | 使用跳跃表和字典实现的有序集合对象。           |
+
+通过encoding属性来设定对象和所使用的编码，而不是特定类型的对象关联一种固定的编码，极大地提升了Redis的灵活性和效率，因为Redis可以根据不同的使用场景来为一个对象设置不同的编码，从而优化对象在某一场景下的效率。
+
+例如：在列表对象包含的元素比较少时，Redis使用压缩列表作为列表对象的底层实现
+
+- 因为压缩列表比双端链表更节约内存，并且在元素数量比较少时，在内存中以连续块方式保存的压缩列表比起双端链表可以更快被载入到内存中
+
+- 随着列表对象包含的元素越来越多，使用压缩列表来保存元素的优势逐渐消失时，对象就会将地城实现从压缩列表转向功能更强、也更适合保存大量元素的双端链表上面
+
+其他对像也会通过这种使用多种敢不同的编码来进行类似的优化
+
+### 1. 字符串对象
+
+> 字符串对象是五种类型中唯一一个会被其他四种对象嵌套的对象
+
+字符串对象的编码可以是int、raw、embstr。
+
+- 如果一个字符串对象保存的是整数值，并且这个整数值可以用long类型来表示，那么字符串对象将会保存在字符串对象结构的ptr属性里面（将void* 转换成long），并将`字符串对象`的编码设置为`int`。 
+- 如果字符串对象保存的是一个字符串值，，并且这个字符串值的长度大于39字节，那么字符串对象将使用一个简单动态字符串（SDS）来保存这个字符串值，并将对象的编码设置为raw
+- 如果字符串对象保存的是一个字符串值，并且这个字符串值的长度小于等于39字节，那么字符串对象将使用embstr编码的方式来保存这个字符串值
+- 可以用long double类型表示的浮点数在Redis中也是作为字符串来保存的，如果要保存一个浮点数到字符串对象里面，那么程序会先将这个浮点数`转换为字符串值`，后保存所得的字符串值。
+  - 有时候需要将保存的值转换为浮点对象后执行某些操作（加减乘除），然后将执行结果转换为字符串值，继续保存在字符串对象里面。   
+
+
+
+- embstr编码：
+
+![Redis 源码解析 6：五大数据类型之字符串 - 1024搜-程序员专属的搜索引擎](https://cdn.jsdelivr.net/gh/mydy930657303/djcPicture@master/202308151734728.png)
+
+存储string类型。分配连续内存，性能较好
+
+```c++
+// 由源码知，创建embstr字符串对象只分配一次空间，且是连续的。
+robj *createEmbeddedStringObject(const char *ptr, size_t len) {
+    robj *o = zmalloc(sizeof(robj)+sizeof(struct sdshdr8)+len+1);
+    struct sdshdr8 *sh = (void*)(o+1);
+
+    o->type = OBJ_STRING;
+    o->encoding = OBJ_ENCODING_EMBSTR;
+    o->ptr = sh+1;
+    o->refcount = 1;
+    if (server.maxmemory_policy & MAXMEMORY_FLAG_LFU) {
+        o->lru = (LFUGetTimeInMinutes()<<8) | LFU_INIT_VAL;
+    } else {
+        o->lru = LRU_CLOCK();
+    }
+
+    sh->len = len;
+    sh->alloc = len;
+    sh->flags = SDS_TYPE_8;
+    if (ptr == SDS_NOINIT)
+        sh->buf[len] = '\0';
+    else if (ptr) {
+        memcpy(sh->buf,ptr,len);
+        sh->buf[len] = '\0';
+    } else {
+        memset(sh->buf,0,len+1);
+    }
+    return o
+```
+
+- raw编码：
+
+![Redis内存优化——String类型介绍及底层原理详解_redis对string做的优化_Mr___Ray的博客-CSDN博客](https://cdn.jsdelivr.net/gh/mydy930657303/djcPicture@master/202308151735880.png)
+
+string类型。分配两次内存，一次分配robj，一次分配sdshdr8，内存不一定连续，性能低于embstr，但是，按照设计可存储更多的数据。
+
+```c++
+robj *createRawStringObject(const char *ptr, size_t len) {
+    return createObject(OBJ_STRING, sdsnewlen(ptr,len));
+}
+
+//第一次分配内存空间，Object的内存空间
+robj *createObject(int type, void *ptr) {
+    robj *o = zmalloc(sizeof(*o));
+    o->type = type;
+    o->encoding = OBJ_ENCODING_RAW;
+    o->ptr = ptr;
+    o->refcount = 1;
+
+    /* Set the LRU to the current lruclock (minutes resolution), or
+     * alternatively the LFU counter. */
+    if (server.maxmemory_policy & MAXMEMORY_FLAG_LFU) {
+        o->lru = (LFUGetTimeInMinutes()<<8) | LFU_INIT_VAL;
+    } else {
+        o->lru = LRU_CLOCK();
+    }
+    return o;
+}
+
+//第二次分配内存空间  sds的
+sds sdsnewlen(const void *init, size_t initlen) {
+    void *sh;
+    sds s;
+    char type = sdsReqType(initlen);
+    /* Empty strings are usually created in order to append. Use type 8
+     * since type 5 is not good at this. */
+    if (type == SDS_TYPE_5 && initlen == 0) type = SDS_TYPE_8;
+    int hdrlen = sdsHdrSize(type);
+    unsigned char *fp; /* flags pointer. */
+
+    sh = s_malloc(hdrlen+initlen+1);
+    if (sh == NULL) return NULL;
+    if (init==SDS_NOINIT)
+        init = NULL;
+    else if (!init)
+        memset(sh, 0, hdrlen+initlen+1);
+    s = (char*)sh+hdrlen;
+    fp = ((unsigned char*)s)-1;
+    switch(type) {
+        case SDS_TYPE_5: {
+            *fp = type | (initlen << SDS_TYPE_BITS);
+            break;
+        }
+        case SDS_TYPE_8: {
+            SDS_HDR_VAR(8,s);
+            sh->len = initlen;
+            sh->alloc = initlen;
+            *fp = type;
+            break;
+        }
+        case SDS_TYPE_16: {
+            SDS_HDR_VAR(16,s);
+            sh->len = initlen;
+            sh->alloc = initlen;
+            *fp = type;
+            break;
+        }
+        case SDS_TYPE_32: {
+            SDS_HDR_VAR(32,s);
+            sh->len = initlen;
+            sh->alloc = initlen;
+            *fp = type;
+            break;
+        }
+        case SDS_TYPE_64: {
+            SDS_HDR_VAR(64,s);
+            sh->len = initlen;
+            sh->alloc = initlen;
+            *fp = type;
+            break;
+        }
+    }
+    if (initlen && init)
+        memcpy(s, init, initlen);
+    s[initlen] = '\0';
+    return s;
+}
+
+```
+
+​	embstr编码是专门用于保存短字符串的一种优化编码方式，这种编码和raw编码一样，都使用redisObject结构和sdshdr结构，而。raw编码会调用两次内存分配函数来分别创建redisObject结构和sdshdr结构，而embstr编码则通过调用一次内存分配函数来哦分配一块连续空间，空间中依次包含redisObject和sdshdr两个结构。如下面两图所示
+
+​	embstr编码的字符串对象在执行命令时，产生的效果和raw编码的字符串对象执行命令时产生的效果是相同的，但使用embstr编码的字符串对象来保存短字符串值有以下好处
+
+- embstr编码将创建字符串对象所需的内存分配次数从raw编码的两次降低为一次。
+- 释放embstr编码的字符串对象只需调用一次内存双方函数，而释放raw编码的字符串对象需要两次
+- 因为embstr编码的字符串对象所有数据保存在一块连续的内存里面，所以这种编码的字符串对象比起raw可以更好地利用`缓存(计组缓存cache，读取内存先把内容读到缓存中，速度更快)`带来的优势
+
+### 2.列表对象
+
+列表对象的编码可以是ziplist或者linkedlist。
+
+ziplist编码的列表对象使用压缩列表作为底层实现，每个压缩列节点（entry）保存了一个列表元素。
+
+linkedlist编码的列表对象使用双端链表作为底层实现，每个双端链表节点（node）都保存了一个`字符串对象`，而每个字符串对象都保存了一个`列表对象的元素`。
+
+> 注意：linkedlist编码的列表对象在底层的双端链表结构中包含了多种字符串对象。这种嵌套字符串的行为在字符串对象之外的对象中均会出现
+
+**编码转换**
+
+当列表对象可以同时满足一下两个条件时，列表对象会使用ziplist：
+
+- 列表对象保存的所有字符串元素的对象都小于64字节
+- 列标对象保存的元素数量小于512个
+
+不能满足这两个条件的列表对象需要使用linkedlist编码。（可以在配置文件中修改）
+
+对于使用ziplist编码的列表对象来说，当使用ziplist编码所需的两个条件的任一个不能被满足时，就会被执行，原本保存在压缩列表中的所有列表元素都会被转移并保存到双端链表里面，对象的编码会由ziplist变为linkedlist。
+
+### 3.哈希对象
+
+哈希对象的编码可以是ziplist或者hashtable。
+
+ziplist编码的哈希对象使用压缩列表作为底层实现，每当有新的键对要加入到哈希对象时，程序会先将保存了键的压缩列表节点推入到压缩列表表尾，然后再将保存了值的压缩列表节点推入到压缩列表表尾，因此：
+
+- 保存了统一键值对的两个节点总数紧挨在一起，包存键的节点在前，保存值的节点在后。
+- 先添加到哈希对象中的键值对会被放在压缩列表的表头方向，而后来添加到哈希表对象中的键值对会被放在压裂列表的表尾方向。
+
+![image-20230815222154346](https://cdn.jsdelivr.net/gh/mydy930657303/djcPicture@master/202308152221396.png)
+
+hashtable编码的哈希对象使用字典作为底层实现，哈希对象中的每个键值对都使用一个字典键值对来保存：
+
+- 字典的每个键都是一个字符串对象，对象中保存了键值对的键；
+- 字典的每个值都是一个字符串对象，对象中保存了键值对的值。
+
+![image-20230815215237867](https://cdn.jsdelivr.net/gh/mydy930657303/djcPicture@master/202308152152919.png)
+
+**编码转换**
+
+当哈希对象可以同时满足一下两个条件时，哈希对象使用ziplist编码：
+
+- 哈希对象保存的所有键值对的键和值的字符串长度都小于64字节
+- 哈希对象保存的键值对数量小于512个；不能满足这两个条件的哈希对象需要使用hashtable编码。
+
+> 关于数量的限定：
+>
+> - 压缩列表无法像传统的哈希表一样使用哈希函数来确定键的存储位置，因为 ziplist 的结构不适合这种方式。ziplist 使用线性搜索来查找键值对。当插入一个新的键值对时，ziplist 会从头到尾遍历键值对，然后判断是否已经存在相同的键
+> - 因此吗，若长度过大，复杂度会大大提高，所以ziplist作为哈希表的底层实现只在数量比较少的时候使用。
+
+### 4.集合对象
+
+集合对象的编码可以是intset或者hashtable。
+
+intset编码的集合使用整数集合作为底层实现，集合对象包含所有元素都被保存在整数集和里面
+
+hashtable编码的集合对象使用字典作为底层实现，字典的每个键都是一个字符串对象，每个字符串对象包含了一个集合元素，而字典的值则全部被设置为NULL。
+
+编码的转换
+
+当集合对象可以同时满足一下两个条件时，对象使用intset编码：
+
+- 集合对象保存的所有元素都是整数值
+- 集合对象保存的元素数量不超过512个；
+
+不能满足这两个条件的集合对象需要使用hashtable编码
+
+### 5.有序集合对象
+
+有序集合的编码可以是ziplist或者skiplist
+
+`ziplist`编码的有序结合对象使用压缩列表作为底层实现，每个集合元素使用两个紧挨在一起的·压缩列表节点来保存，第一个节点保存元素的成员，而第二个节点则保存元素的分值
+
+压缩列表内的集合元素按分值从小到大进行排序，分值小的元素被放在靠近表头的位置，而分值较大的元素则被放置在靠近表尾的位置。
+
+
+
+![image-20230815221025630](https://cdn.jsdelivr.net/gh/mydy930657303/djcPicture@master/202308152210671.png)
+
+![image-20230815221119875](https://cdn.jsdelivr.net/gh/mydy930657303/djcPicture@master/202308152211916.png)
+
+`skiplist`编码的有序集合对象使用zset结构作为底层实现，一个zset结构同时包含一个字典和一个跳跃表：
+
+```c++
+typedef struct zset{
+    zskiplist *zsl;
+    dict *dict;
+} zset;
+```
+
+zset结构中，zsl跳跃表按分值从大到小保存了所有结合元素，每个跳跃表节点都保存了一个集合元素：跳跃表节点的object属性保存了元素成员，而跳跃表节点的socre属性则保存了元素的分值。通过这跳跃表，程序可以对有序集合进行范围型操作
+
+除外，zset结构中的dict字典为有序集合创建了一个成员到分值的映射，字典的每一个键值对都保存了一个集合元素：字典的键保存元素成员，值保存了元素的分值，程序可以通过O（0）复杂度通过元素来获取分值，后通过分值在跳跃表中查询
+
+有序集合每个元素的成员都是一个`字符串对象`，而每个元素的`分值都是一个double类型`的浮点数。虽然zset结构同时使用跳跃表来保存有序集合的元素，但是这两张数据结构都是`通过指针来共享元素的成员和分值的`.
+
+> 为什么有序链表需要同时使用跳跃表和字典来实现？
+>
+> 理论上两种都可以分别使用，但性能上比起同时使用字典和跳跃表都会有所降低。
+>
+> 例如，**只用字典**的话虽然可以O(1)复杂度查找成员对象，但是字典是无序的，所以如果进行范围型操作，则需要对所有元素进行排序，完成这种排序至少需要O(NlogN)时间复杂度，以及额外的O(N)内存空间。
+>
+> **只用跳跃表**的话，那么根据成员查找分值这一操作将会从O（1）上升至O（N），**因为没有分值，在只能从头遍历，寻找元素对象。**
+>
+> 
+>
+> 在有序集合中，跳跃表用于实现成员的排序和范围查找操作，而字典用于存储成员与分值之间的映射关系。这样一来，在进行根据成员查找分值这样的操作时，通过字典可以在常数时间内获取到对应的分值，而不需要进行线性搜索。所以，有序集合的结构设计充分利用了跳跃表和字典的优势，以提供高效的操作。
+
+编码的转换，
+
+当有序集合对象可以同时满足以下两个条件时，对象使用ziplist编码：
+
+- 有序集合保存的元素数量小于128个
+- 有序集合保存的所有元素的长度都小于64字节
+
+否则有序集合对象将使用skiplist编码。 
+
+### 类型检查与命令多态
+
+### 内存回收
+
+### 对象共享
+
+### 对象的空转时长
+
+### 存疑
+
+有序集合不加分值会怎样？报错？
+
+所有对象都是字符串、int或者浮点数？
